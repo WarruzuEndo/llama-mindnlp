@@ -23,7 +23,7 @@ import numpy as np
 
 import mindspore
 from mindspore import nn, ops, Parameter
-from mindspore.communication import get_group_size, get_rank
+from mindspore.communication import get_group_size
 
 from mindnlp.parallel.layers import (
     ParallelEmbedding,
@@ -76,38 +76,57 @@ class RMSNorm(nn.Cell):
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, start_pos: int, seqlen: int, theta: float = 10000.0):
+def polar(pabs, angle):
+    '''
+    polar
+    '''
+    return ops.Complex()(pabs * ops.cos(angle), pabs * ops.sin(angle))
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     '''
     precompute_freqs_cis
     '''
     freqs = 1.0 / (theta ** (ops.cast(ops.arange(0, dim, 2)[: (dim // 2)], mindspore.float32) / dim))
-    _t = ops.arange(end).astype(freqs.dtype)
-    freqs = ops.cast(ops.outer(_t, freqs), mindspore.float32) 
-    # Different from paper, but it uses a different permutation in order to obtain the same calculation
-    emb = ops.cat((freqs, freqs), axis=-1)
-    cos_cached = emb.cos()[None, :, None, :][:, start_pos : start_pos + seqlen, :, ...]
-    sin_cached = emb.sin()[None, :, None, :][:, start_pos : start_pos + seqlen, :, ...]
-    return (cos_cached, sin_cached,)
+    _t = ops.arange(end).astype(freqs.dtype)  # type: ignore
+    freqs = ops.cast(ops.outer(_t, freqs), mindspore.float32)  # type: ignore
+    # TODO(khoray): wait response of lyf
+    freqs_cis = polar(ops.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
 
 
-def rotate_half(_x):  # [bsz, seqlen, n_local_heads, head_dim]
-    """Rotates half the hidden dims of the input."""
-    x_1 = _x[..., : _x.shape[-1] // 2]
-    x_2 = _x[..., _x.shape[-1] // 2 :] 
-    return ops.cat((-x_2, x_1), axis=-1)
+def reshape_for_broadcast(freqs_cis: mindspore.Tensor, _x: mindspore.Tensor):
+    '''
+    reshape_for_broadcast
+    '''
+    ndim = _x.ndim
+    assert 1 < ndim
+    assert freqs_cis.shape == (_x.shape[1], _x.shape[-1])
+    shape = [d if i in (1, ndim - 1) else 1 for i, d in enumerate(_x.shape)]
+    return freqs_cis.view(*shape)
+
+
+def view_as_complex(_x: mindspore.Tensor):
+    '''
+    view_as_complex
+    '''
+    return ops.Complex()(_x[:,:,:,:,0], _x[:,:,:,:,1])
 
 
 def apply_rotary_emb(
     x_q: mindspore.Tensor,
     x_k: mindspore.Tensor,
-    cos: mindspore.Tensor,
-    sin: mindspore.Tensor,
+    freqs_cis: mindspore.Tensor,
 ) -> Tuple[mindspore.Tensor, mindspore.Tensor]:
     '''
     apply_rotary_emb
     '''
-    xq_out = (x_q * cos) + (rotate_half(x_q) * sin)
-    xk_out = (x_k * cos) + (rotate_half(x_k) * sin)
+    xq_ = view_as_complex(x_q.float().reshape(*x_q.shape[:-1], -1, 2))
+    xk_ = view_as_complex(x_k.float().reshape(*x_k.shape[:-1], -1, 2))
+    # xq_ : [bsz, seqlen, n_heads, head_dim]
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = ops.flatten(ops.view_as_real(xq_ * freqs_cis), start_dim=3)
+    xk_out = ops.flatten(ops.view_as_real(xk_ * freqs_cis), start_dim=3)
     return xq_out.astype(x_q.dtype), xk_out.astype(x_k.dtype)
 
 
@@ -148,7 +167,7 @@ class Attention(nn.Cell):
             input_is_parallel=True,
             dtype=mindspore.float16,
         )
-        
+
         self.max_batch_size = config.max_batch_size
         self.max_seq_len = config.max_seq_len
 
@@ -161,7 +180,7 @@ class Attention(nn.Cell):
         self.inv_norm_factor = mindspore.Tensor(1.0 / math.sqrt(self.head_dim), dtype=mindspore.float16)
 
     def construct(self, _x: mindspore.Tensor, start_pos: int,
-                  mask: Optional[mindspore.Tensor]):
+                  freqs_cis: mindspore.Tensor,  mask: Optional[mindspore.Tensor]):
         '''
         construct
         '''
@@ -175,10 +194,7 @@ class Attention(nn.Cell):
 
         # xq = xk = xv = [bsz, seqlen, self.n_local_heads, self.head_dim]
 
-        cos, sin = precompute_freqs_cis(
-            self.head_dim, self.max_seq_len * 2, start_pos, seqlen
-        )
-        x_q, x_k = apply_rotary_emb(x_q, x_k, cos, sin)
+        x_q, x_k = apply_rotary_emb(x_q, x_k, freqs_cis=freqs_cis,)
 
         self.cache_k = self.cache_k.astype(x_q.dtype)
         self.cache_v = self.cache_v.astype(x_q.dtype)
@@ -227,7 +243,7 @@ class FeedForward(nn.Cell):
         self.w_3 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, dtype=mindspore.float16
         )
-    
+
     def silu(self, x):
         return x * ops.sigmoid(x)
 
@@ -282,9 +298,14 @@ class Transformer(nn.Cell):
             config.dim, config.vocab_size, bias=False, dtype=mindspore.float16
         )
 
+        self.freqs_cis = precompute_freqs_cis(
+            self.config.dim // self.config.n_heads, self.config.max_seq_len * 2
+        )
+
     def construct(self, tokens: mindspore.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape   # tokens.shape = [bsz * seqlen]
         _h = self.tok_embeddings(tokens) # h = [bsz * seqlen * emb_dim]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen] # freqs_cis = [seqlen, emb_dim // nheads // 2]
 
         mask = None
         if seqlen > 1:
@@ -292,7 +313,7 @@ class Transformer(nn.Cell):
             mask = ops.triu(mask, diagonal=start_pos + 1).astype(_h.dtype)
 
         for layer in self.layers:
-            _h = layer(_h, start_pos, mask)
+            _h = layer(_h, start_pos, freqs_cis, mask)
         _h = self.norm(_h) # h = [bsz * seqlen * emb_dim]
         output = self.output(_h[:, -1, :])  # only compute last logits  output = [bsz * vocab_size]
         return ops.cast(output, mindspore.float32)

@@ -47,7 +47,7 @@ class LLaMA:
                 probs = ops.softmax(logits / temperature, axis=-1)
                 next_token = sample_top_p(probs, top_p)
             else:
-                next_token = ops.argmax(logits, dim=-1)
+                next_token = ops.argmax(logits, dim=-1).astype(mindspore.int32)
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
             next_token = ops.where(
